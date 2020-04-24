@@ -67,6 +67,16 @@ type gbfsStationStatus struct {
 	Data        gbfsStationStatusData `json:"data"`
 }
 
+type stationInformationResult struct {
+	Information gbfsStationInformation
+	Error       error
+}
+
+type stationStatusResult struct {
+	Status gbfsStationStatus
+	Error  error
+}
+
 func fetch(url string) ([]byte, error) {
 
 	req, err := http.NewRequest("GET", url, nil)
@@ -91,50 +101,96 @@ func fetch(url string) ([]byte, error) {
 	return body, nil
 }
 
-func fetchStationInformation() (gbfsStationInformation, error) {
-
-	var stationInformation gbfsStationInformation
+func fetchStationInformation(informationChannel chan stationInformationResult) {
 
 	body, err := fetch(stationInformationAddress)
 	if err != nil {
-		return stationInformation, err
+		informationChannel <- stationInformationResult{Error: err}
+		return
 	}
 
+	var stationInformation gbfsStationInformation
 	err = json.Unmarshal(body, &stationInformation)
+	if err != nil {
+		informationChannel <- stationInformationResult{Error: err}
+		return
+	}
 
-	return stationInformation, err
+	informationChannel <- stationInformationResult{Information: stationInformation}
 }
 
-func fetchStationStatus() (gbfsStationStatus, error) {
-
-	var stationStatus gbfsStationStatus
+func fetchStationStatus(statusChannel chan stationStatusResult) {
 
 	body, err := fetch(stationStatusAddress)
 	if err != nil {
-		return stationStatus, nil
+		statusChannel <- stationStatusResult{Error: err}
+		return
 	}
 
+	var stationStatus gbfsStationStatus
 	err = json.Unmarshal(body, &stationStatus)
+	if err != nil {
+		statusChannel <- stationStatusResult{Error: err}
+		return
+	}
 
-	return stationStatus, nil
+	statusChannel <- stationStatusResult{Status: stationStatus}
+}
+
+func fetchData() (map[string]gbfsStationInformationStation, map[string]gbfsStationStatusStation, error) {
+
+	statusChannel := make(chan stationStatusResult)
+	informationChannel := make(chan stationInformationResult)
+
+	defer close(statusChannel)
+	defer close(informationChannel)
+
+	go fetchStationStatus(statusChannel)
+	go fetchStationInformation(informationChannel)
+
+	informationMap := make(map[string]gbfsStationInformationStation)
+	statusMap := make(map[string]gbfsStationStatusStation)
+
+	var err error
+
+	// Wait for both fetch operations to finish before we process the data
+	for i := 0; i < 2; i++ {
+		select {
+		case statusResult := <-statusChannel:
+			if statusResult.Error != nil {
+				err = statusResult.Error
+			} else {
+				for _, station := range statusResult.Status.Data.Stations {
+					statusMap[station.StationID] = station
+				}
+			}
+		case informationResult := <-informationChannel:
+			if informationResult.Error != nil {
+				err = informationResult.Error
+			} else {
+				for _, station := range informationResult.Information.Data.Stations {
+					informationMap[station.StationID] = station
+				}
+			}
+		}
+	}
+
+	return informationMap, statusMap, err
 }
 
 func main() {
 	client = &http.Client{Timeout: requestTimeout}
 
-	stationInformation, err := fetchStationInformation()
+	info, status, err := fetchData()
 	if err != nil {
 		fmt.Println(err)
-	}
-	for _, station := range stationInformation.Data.Stations {
-		fmt.Println(station)
 	}
 
-	stationStatus, err := fetchStationStatus()
-	if err != nil {
-		fmt.Println(err)
+	for _, inf := range info {
+		fmt.Println(inf)
 	}
-	for _, station := range stationStatus.Data.Stations {
-		fmt.Println(station)
+
+	for _, stat := range status {
+		fmt.Println(stat)
 	}
 }
