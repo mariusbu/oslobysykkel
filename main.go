@@ -4,30 +4,35 @@ import (
 	"encoding/json"
 	"fmt"
 	"io/ioutil"
+	"log"
 	"net/http"
-	"sort"
 	"time"
 
-	"github.com/gdamore/tcell"
-	"github.com/rivo/tview"
+	"github.com/gorilla/mux"
+	"github.com/patrickmn/go-cache"
 )
 
 // We're using the open API from Oslo Bysykkel
 // See https://oslobysykkel.no/apne-data/sanntid
 
+// NOTE: this uses port 8080 to allow testing locally without
+// elevated privileges required to bind to port 80 (":http").
+// For production we should use TLS and port 443 (":https").
+
 const (
 	updateInterval            = 10 * time.Second
 	requestTimeout            = 10 * time.Second
+	cacheCleanupInterval      = 1 * time.Minute
+	cacheKey                  = "stations"
 	clientIdentifier          = "test-test"
 	stationInformationAddress = "https://gbfs.urbansharing.com/oslobysykkel.no/station_information.json"
 	stationStatusAddress      = "https://gbfs.urbansharing.com/oslobysykkel.no/station_status.json"
+	serverAddressPort         = ":8080"
 )
 
 var (
-	client *http.Client
-	app    *tview.Application
-	frame  *tview.Frame
-	table  *tview.Table
+	client        *http.Client
+	stationsCache *cache.Cache
 )
 
 // The 'gbfs' structures are mapped from the General Bikeshare Feed Specification
@@ -86,9 +91,10 @@ type stationStatusResult struct {
 }
 
 type stationData struct {
-	Name                   string
-	NumberOfBikesAvailable int
-	NumberOfDocksAvailable int
+	StationID              string `json:"station_id"`
+	Name                   string `json:"name"`
+	NumberOfBikesAvailable int    `json:"num_bikes_available"`
+	NumberOfDocksAvailable int    `json:"num_docks_available"`
 }
 
 func fetch(url string) ([]byte, error) {
@@ -105,11 +111,11 @@ func fetch(url string) ([]byte, error) {
 		return nil, err
 	}
 
+	defer resp.Body.Close()
+
 	if resp.StatusCode != http.StatusOK {
 		return nil, fmt.Errorf("Http GET to %s failed with status code %d", url, resp.StatusCode)
 	}
-
-	defer resp.Body.Close()
 
 	body, err := ioutil.ReadAll(resp.Body)
 	if err != nil {
@@ -155,7 +161,7 @@ func fetchStationStatus(statusChannel chan stationStatusResult) {
 	statusChannel <- stationStatusResult{Status: stationStatus}
 }
 
-func fetchData() ([]stationData, string, error) {
+func fetchData() (map[string]stationData, error) {
 
 	statusChannel := make(chan stationStatusResult)
 	informationChannel := make(chan stationInformationResult)
@@ -194,96 +200,126 @@ func fetchData() ([]stationData, string, error) {
 	}
 
 	if err != nil {
-		return nil, " 🚒 Vi klarte ikke å hente data. Vent litt, så prøver vi igjen!", err
+		return nil, err
 	}
 
 	// NOTE: we assume that having more status elements than information elements is not a problem.
-	// Missing status for a station will also not result in an error, but we will inform the user.
+	// Missing status for a station will also not result in an error, but we will log it as a warning.
 
-	var message string
-	stations := make([]stationData, 0, len(informationMap))
+	stations := make(map[string]stationData)
 	for stationID, information := range informationMap {
 		status, exists := statusMap[stationID]
 		if !exists {
-			message = " 🙈 Vi mangler status for noen stasjoner. Vent litt, så prøver vi igjen!"
+			log.Printf("We are missing the status for some stations.")
 		} else {
-			stations = append(stations, stationData{
+			stations[stationID] = stationData{
+				StationID:              stationID,
 				Name:                   information.Name,
 				NumberOfDocksAvailable: status.NumberOfDocksAvailable,
 				NumberOfBikesAvailable: status.NumberOfBikesAvailable,
-			})
+			}
 		}
 	}
 
-	sort.Slice(stations, func(i, j int) bool { return stations[i].Name < stations[j].Name })
-
-	return stations, message, err
+	return stations, err
 }
 
-func updateTable() {
+func updateStationsCache() {
+
+	// NOTE: we run a continous go-routine that polls the BySykkel API periodically.
+	// This allows our API endpoints to return data from the cache very quickly and
+	// without locking or waiting for requests to the BySykkel API.
+	// The downside is that we continue to fetch data even if we have very few requests.
+
 	for {
-		stations, message, err := fetchData()
+		log.Printf("Fetching data from the BySykkel API.")
 
-		app.QueueUpdateDraw(func() {
-			offsetRow, offsetColumn := table.GetOffset()
-
-			if err == nil {
-				table.Clear()
-				table.SetCell(0, 0, &tview.TableCell{Text: " Stasjon ", Align: tview.AlignCenter, Color: tcell.ColorLightBlue})
-				table.SetCell(0, 1, &tview.TableCell{Text: " Tilgjengelige låser ", Align: tview.AlignCenter, Color: tcell.ColorLightBlue})
-				table.SetCell(0, 2, &tview.TableCell{Text: " Ledige sykler ", Align: tview.AlignCenter, Color: tcell.ColorLightBlue})
-
-				for row, station := range stations {
-					bikes := fmt.Sprintf("%d", station.NumberOfBikesAvailable)
-					docks := fmt.Sprintf("%d", station.NumberOfDocksAvailable)
-					table.SetCell(row+1, 0, &tview.TableCell{Text: station.Name, Align: tview.AlignLeft, Color: tcell.ColorWhite})
-					table.SetCell(row+1, 1, &tview.TableCell{Text: bikes, Align: tview.AlignCenter, Color: tcell.ColorWhite})
-					table.SetCell(row+1, 2, &tview.TableCell{Text: docks, Align: tview.AlignCenter, Color: tcell.ColorWhite})
-				}
-				table.SetOffset(offsetRow, offsetColumn)
-			}
-
-			updateFrameTexts(message)
-		})
+		stations, err := fetchData()
+		if err != nil {
+			log.Printf("Fetching data failed with the error: %s", err.Error())
+		} else {
+			stationsCache.Set(cacheKey, stations, cache.DefaultExpiration)
+		}
 
 		time.Sleep(updateInterval)
 	}
 }
 
-func updateFrameTexts(message string) {
-	frame.Clear()
-	frame.AddText(" 🚴 Oslo BySykkel 🚴", true, tview.AlignLeft, tcell.ColorLightBlue).
-		AddText("", true, tview.AlignLeft, tcell.ColorLightBlue).
-		AddText(" Hei!👋\t Du kan bla i listen med ⍐ og ⍗. Avslutt med 'q'.", true, tview.AlignLeft, tcell.ColorLightBlue).
-		AddText(message, false, tview.AlignLeft, tcell.ColorLightBlue)
+// Root implements the `/` endpoint.
+// Respons with a text to indicate that the server is alive.
+func Root(w http.ResponseWriter, req *http.Request) {
+	// We set the Cache-Control to no-store so we can use this endpoint to check if the server is running.
+	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+	w.Header().Set("Cache-Control", "no-store")
+	w.WriteHeader(http.StatusOK)
+	fmt.Fprintf(w, "I am listening... on %s 🤖\n", serverAddressPort)
+}
+
+// AllStations implements the `stations` endpoint.
+// Responds with a JSON array of all stationData objects.
+func AllStations(w http.ResponseWriter, req *http.Request) {
+
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Cache-Control", "public, max-age=10")
+	w.Header().Set("Access-Control-Allow-Origin", "*")
+
+	var cachedStations map[string]stationData
+	if item, found := stationsCache.Get(cacheKey); found {
+		cachedStations = item.(map[string]stationData)
+	} else {
+		// If the cache is empty, something went wrong
+		log.Printf("The cache failed when serving `%s`.", req.URL.String())
+		w.WriteHeader(http.StatusInternalServerError)
+		return
+	}
+
+	stations := make([]stationData, 0, len(cachedStations))
+	for _, station := range cachedStations {
+		stations = append(stations, station)
+	}
+
+	w.WriteHeader(http.StatusOK)
+	json.NewEncoder(w).Encode(stations)
+}
+
+// SingleStation implements the `stations/<station_id>` endpoint.
+// Responds with a single JSON stationData object.
+func SingleStation(w http.ResponseWriter, req *http.Request) {
+
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Cache-Control", "public, max-age=10")
+	w.Header().Set("Access-Control-Allow-Origin", "*")
+
+	var cachedStations map[string]stationData
+	if item, found := stationsCache.Get(cacheKey); found {
+		cachedStations = item.(map[string]stationData)
+	} else {
+		// If the cache is empty, something went wrong
+		log.Printf("The cache failed when serving `%s`.", req.URL.String())
+		w.WriteHeader(http.StatusInternalServerError)
+		return
+	}
+
+	stationID := mux.Vars(req)["id"]
+	if station, ok := cachedStations[stationID]; ok {
+		w.WriteHeader(http.StatusOK)
+		json.NewEncoder(w).Encode(station)
+	} else {
+		w.WriteHeader(http.StatusNotFound)
+	}
 }
 
 func main() {
 	client = &http.Client{Timeout: requestTimeout}
+	stationsCache = cache.New(cache.NoExpiration, cacheCleanupInterval)
 
-	table = tview.NewTable().
-		SetFixed(1, 0).
-		SetSeparator(tview.BoxDrawingsLightVertical).
-		SetBordersColor(tcell.ColorGray).
-		SetBorders(true)
+	router := mux.NewRouter().StrictSlash(true)
+	router.HandleFunc("/", Root)
+	router.HandleFunc("/api/v1/stations", AllStations).Methods("GET")
+	router.HandleFunc("/api/v1/stations/{id}", SingleStation).Methods("GET")
 
-	frame = tview.NewFrame(table).
-		SetBorders(1, 1, 1, 1, 2, 2)
+	go updateStationsCache()
 
-	updateFrameTexts("📦 henter data ...")
-
-	app = tview.NewApplication().
-		SetRoot(frame, true).
-		SetInputCapture(func(event *tcell.EventKey) *tcell.EventKey {
-			if event.Rune() == 'q' {
-				app.Stop()
-			}
-			return event
-		})
-
-	go updateTable()
-
-	if err := app.Run(); err != nil {
-		panic(err)
-	}
+	log.Printf("Starting server on %s", serverAddressPort)
+	log.Fatal(http.ListenAndServe(serverAddressPort, router))
 }

@@ -29,7 +29,7 @@ type testFetchStationStatusCase struct {
 type testFetchDataCase struct {
 	FetchStatus      testFetchCase
 	FetchInformation testFetchCase
-	ExpectedData     []stationData
+	ExpectedData     map[string]stationData
 }
 
 // NOTE: rather than spinning up a httptest.Server we test by replacing the
@@ -390,18 +390,21 @@ func TestFetchData(t *testing.T) {
 				ExpectedRequestAddress: "https://gbfs.urbansharing.com/oslobysykkel.no/station_information.json",
 				ExpectError:            false,
 			},
-			ExpectedData: []stationData{
-				{
+			ExpectedData: map[string]stationData{
+				"623": {
+					StationID:              "623",
 					Name:                   "7 Juni Plassen",
 					NumberOfBikesAvailable: 4,
 					NumberOfDocksAvailable: 8,
 				},
-				{
+				"627": {
+					StationID:              "627",
 					Name:                   "Skøyen Stasjon",
 					NumberOfBikesAvailable: 7,
 					NumberOfDocksAvailable: 5,
 				},
-				{
+				"610": {
+					StationID:              "610",
 					Name:                   "Sotahjørnet",
 					NumberOfBikesAvailable: 4,
 					NumberOfDocksAvailable: 9,
@@ -584,7 +587,7 @@ func TestFetchData(t *testing.T) {
 			return &http.Response{}
 		})}
 
-		stations, _, err := fetchData()
+		stations, err := fetchData()
 
 		if !testCase.FetchStatus.ExpectError && !testCase.FetchInformation.ExpectError && err != nil {
 			t.Errorf("We got an unexpected error: %s", err.Error())
