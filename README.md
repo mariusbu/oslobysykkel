@@ -13,6 +13,12 @@ Programmet kjøres med
 
 `go run main.go`
 
+## Kjøre testene
+
+Enhetstestene kjøres med
+
+`go test`
+
 ## Hvem er brukeren ? 
 
 Dette blir selvsagt litt kunstig, gitt utgangspunktet. Men jeg har bestemt meg for at brukeren er noen som lever i kommandolinjen (f.eks. en utvikler eller sysadmin), og som har lyst til å følge med på om det er ledige sykler ved hans/hennes/hens favoritt-stasjon. 🤓
