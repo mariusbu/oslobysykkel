@@ -105,6 +105,10 @@ func fetch(url string) ([]byte, error) {
 		return nil, err
 	}
 
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("Http GET to %s failed with status code %d", url, resp.StatusCode)
+	}
+
 	defer resp.Body.Close()
 
 	body, err := ioutil.ReadAll(resp.Body)
